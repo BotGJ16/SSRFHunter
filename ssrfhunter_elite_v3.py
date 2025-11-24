@@ -2,7 +2,7 @@
 """
 SSRFHunter Elite v3.0 - 2025 SSRF Arsenal
 Complete SSRF Framework with 2025 Threat Intelligence
-Author: Private Researcher
+Author: BotGJ16 Researcher
 """
 import argparse
 import asyncio
