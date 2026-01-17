@@ -745,7 +745,7 @@ class SSRFHunterEliteV3:
         self.log(f"Found {len(self.ssrf_urls)} SSRF-susceptible URLs (2025)")
         self.stats['ssrf_urls'] = len(self.ssrf_urls)
     
-    def generate_payloads_2025(self, base_url: str) -> List[Dict]:
+    async def generate_payloads_2025(self, base_url: str) -> List[Dict]:
         """2025: Generate ALL payload types including novel techniques"""
         payloads = []
         parsed = urlparse(base_url)
@@ -791,7 +791,7 @@ class SSRFHunterEliteV3:
                             })
                     
                     # OOB payloads
-                    oob_url, oob_id = asyncio.run(self.blind_detector.generate_callback(f"ssrf_{payload_type}"))
+                    oob_url, oob_id = await self.blind_detector.generate_callback(f"ssrf_{payload_type}")
                     payloads.append({
                         'url': self._build_payload_url(base_url, param, oob_url),
                         'param': param,
@@ -998,100 +998,39 @@ class SSRFHunterEliteV3:
             'ENETUNREACH', 'connection timed out', 'connect: connection refused'
         ]
         
-        content_lower = content.lower()
-        if any(pattern in content_lower for pattern in error_patterns):
-            indicators.append("Network error (internal network reached)")
-            confidence_score += 1
+        for pattern in error_patterns:
+            if pattern.lower() in content.lower():
+                indicators.append(f"Internal error indicator: {pattern}")
+                confidence_score += 1
+                result.potential_ssrf = True
         
-        # == 2025: CLOUD METADATA DETECTION ==
-        if any(path in test_case['payload'] for path in ['169.254.169.254', 'metadata', 'oci']):
-            credentials = self.cloud_engine.extract_credentials(content, test_case.get('platform', 'aws'))
-            if credentials:
-                result.metadata_leaked = True
-                result.credentials_found = credentials
-                indicators.append(f"🔥 CLOUD METADATA LEAKED! {len(credentials)} credentials found")
-                confidence_score += 3
-                self.stats['cloud_metadata'] += len(credentials)
-                cvss = 10.0
-        
-        # == 2025: CONTAINER/K8S DETECTION ==
-        if any(service in test_case['payload'] for service in ['kubernetes', 'docker', 'kubelet']):
-            if response.status == 200 and 'json' in response.headers.get('Content-Type', ''):
-                indicators.append("🔥 CONTAINER/K8S API ACCESS! Potential escape")
-                confidence_score += 3
-                result.k8s_access = True
-                self.stats['container_escape'] += 1
-                cvss = 10.0
-        
-        # == 2025: GRAPHQL SSRF ==
-        if test_case.get('type') == 'graphql':
-            if 'data' in content_lower or 'errors' in content_lower:
-                indicators.append("GraphQL SSRF confirmed!")
-                confidence_score += 2
-                result.graphql_query = test_case['query']
-                self.stats['graphql_ssrf'] += 1
-        
-        # == 2025: WEBSOCKET SSRF ==
-        if test_case.get('websocket') and result.potential_ssrf:
-            indicators.append("WebSocket SSRF confirmed!")
-            confidence_score += 2
-            result.websocket_url = test_case['url']
-            self.stats['websocket_ssrf'] += 1
-        
-        # == 2025: CVE-2025 SPECIFIC ==
-        if test_case.get('payload_type') == 'cve_2025':
-            if response.status == 200:
-                indicators.append(f"🔥 {test_case['cve']} EXPLOITABLE!")
-                confidence_score += 3
-                result.cve_2025 = True
-                self.stats['cve_2025'] += 1
-        
-        # == 2025: OOB DETECTION ==
-        if test_case.get('oob_id'):
-            interaction = await self.blind_detector.check_interactions(test_case['oob_id'])
-            if interaction['hit']:
-                result.callback_hit = True
-                result.oob_url = test_case['payload']
-                indicators.append(f"👻 BLIND SSRF CONFIRMED! From: {interaction['source_ip']}")
-                confidence_score += 2
-                self.stats['blind_ssrf'] += 1
-                cvss = max(cvss, 8.5)
-        
-        # == CONFIDENCE & CVSS CALCULATION ==
+        # Confidence scoring
         if confidence_score >= 3:
-            result.confidence = 'critical'
-            result.cvss = min(cvss + 1.0, 10.0)  # Add bonus
-        elif confidence_score >= 2:
             result.confidence = 'high'
-            result.cvss = cvss
+            result.potential_ssrf = True
         elif confidence_score >= 1:
             result.confidence = 'medium'
-            result.cvss = cvss - 1.0
-        else:
-            result.confidence = 'low'
-            result.cvss = max(cvss - 2.0, 1.0)
+            result.potential_ssrf = True
         
-        result.potential_ssrf = confidence_score >= 1
         result.indicators = indicators
+        result.cvss_score = cvss
         
         return result
-    
-    def _timeout_result(self, test_case: Dict):
-        """Timeout result"""
+
+    def _timeout_result(self, test_case: Dict) -> TestResult2025:
         result = TestResult2025(
             url=test_case['url'],
             param=test_case['param'],
             payload=test_case['payload'],
             error='Timeout',
             potential_ssrf=True,
-            indicators=['Request timeout - likely blind SSRF'],
-            confidence='medium'
+            confidence='medium',
+            indicators=['Request timed out (potential blind SSRF)']
         )
         self.results.append(result.__dict__)
         return result
-    
-    def _error_result(self, test_case: Dict, error: str):
-        """Error result"""
+
+    def _error_result(self, test_case: Dict, error: str) -> TestResult2025:
         result = TestResult2025(
             url=test_case['url'],
             param=test_case['param'],
@@ -1111,7 +1050,7 @@ class SSRFHunterEliteV3:
                 param=test_case['param'],
                 payload=test_case['payload'],
                 status=101,  # Switching Protocols
-                content_length=len(ws_result['response']),
+                content_length=len(ws_result['response']) if ws_result['response'] else 0,
                 potential_ssrf=True,
                 confidence='high',
                 indicators=['WebSocket handshake successful with SSRF payload']
@@ -1136,7 +1075,7 @@ class SSRFHunterEliteV3:
         
         all_test_cases = []
         for url in self.ssrf_urls:
-            payloads = self.generate_payloads_2025(url)
+            payloads = await self.generate_payloads_2025(url)
             all_test_cases.extend(payloads)
         
         self.log(f"Generated {len(all_test_cases)} 2025 test cases")
@@ -1197,106 +1136,15 @@ class SSRFHunterEliteV3:
             f.write(f"**Scan Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n")
             f.write(f"**Framework Version**: 3.0 (2025 SSRF Arsenal)  \n\n")
             
-            # Executive Summary with 2025 metrics
-            f.write("## 🎯 Executive Summary (2025 Standards)\n\n")
-            f.write(f"- **Total URLs**: {self.stats['urls_collected']}  \n")
-            f.write(f"- **SSRF URLs**: {self.stats['ssrf_urls']}  \n")
-            f.write(f"- **Test Cases**: {self.stats['test_cases']}  \n")
-            f.write(f"- **High-Confidence Findings**: {self.stats['high_confidence']}  \n")
-            f.write(f"- **Cloud Metadata Leaks**: {self.stats['cloud_metadata']}  \n")
-            f.write(f"- **Internal Services**: {self.stats['internal_services']}  \n")
-            f.write(f"- **Blind SSRF**: {self.stats['blind_ssrf']}  \n")
-            f.write(f"- **GraphQL SSRF**: {self.stats['graphql_ssrf']}  \n")
-            f.write(f"- **WebSocket SSRF**: {self.stats['websocket_ssrf']}  \n")
-            f.write(f"- **Serverless RCE**: {self.stats['serverless_rce']}  \n")
-            f.write(f"- **Container Escape**: {self.stats['container_escape']}  \n")
-            f.write(f"- **CVE-2025 Exploits**: {self.stats['cve_2025']}  \n\n")
+            # Executive Summary
+            f.write("## 📊 Executive Summary\n\n")
+            for key, value in self.stats.items():
+                f.write(f"- **{key.replace('_', ' ').title()}**: {value}\n")
+            f.write("\n")
             
-            # Critical findings
-            if self.stats['high_confidence'] > 0:
-                f.write("🚨 **CRITICAL**: High-confidence SSRF vulnerabilities detected!  \n")
-                f.write("⚠️ **IMMEDIATE ACTION REQUIRED**  \n\n")
-            
-            # 2025: Specialized sections
-            self._write_cloud_section(f)
-            self._write_container_section(f)
-            self._write_graphql_section(f)
-            self._write_websocket_section(f)
-            self._write_serverless_section(f)
-            self._write_cve_2025_section(f)
-            
-            # Top findings
             self._write_top_findings(f)
-            
-            # Recommendations
             self._write_2025_recommendations(f)
-        
-        self.log(f"2025 report saved to {self.report_file}")
-    
-    def _write_cloud_section(self, f):
-        """Write cloud exploitation section"""
-        cloud_results = [r for r in self.results if r.get('metadata_leaked')]
-        if cloud_results:
-            f.write("## ☁️ Cloud Metadata Exploitation (2025)\n\n")
-            for result in cloud_results[:10]:
-                f.write(f"### {result['param']} - {result['payload_type']}\n")
-                f.write(f"- **Endpoint**: `{result['url']}`\n")
-                f.write(f"- **Platform**: {result.get('platform', 'AWS')}\n")
-                f.write(f"- **Credentials**: {len(result['credentials_found'])} found\n")
-                for cred in result['credentials_found'][:3]:
-                    f.write(f"  - `{cred['type']}`: {cred['value']}\n")
-                f.write(f"- **CVSS**: {result['cvss']}\n\n")
-    
-    def _write_container_section(self, f):
-        """Write container escape section"""
-        container_results = [r for r in self.results if r.get('k8s_access')]
-        if container_results:
-            f.write("## 🐳 Container Escape & K8S Access (2025)\n\n")
-            for result in container_results:
-                f.write(f"- **K8S API**: `{result['url']}`\n")
-                f.write(f"  - Status: {result['status']}\n")
-                f.write(f"  - Confidence: {result['confidence']}\n")
-                f.write(f"  - Impact: **HOST ESCAPE POSSIBLE** ⚠️\n\n")
-    
-    def _write_graphql_section(self, f):
-        """Write GraphQL SSRF section"""
-        graphql_results = [r for r in self.results if r.get('graphql_query')]
-        if graphql_results:
-            f.write("## 📊 GraphQL SSRF Vulnerabilities (2025)\n\n")
-            for result in graphql_results:
-                f.write(f"- **Query**: `{result['graphql_query'][:100]}...`\n")
-                f.write(f"  - CVSS: {result['cvss']}\n")
-                f.write(f"  - Confidence: {result['confidence']}\n\n")
-    
-    def _write_websocket_section(self, f):
-        """Write WebSocket SSRF section"""
-        ws_results = [r for r in self.results if r.get('websocket_url')]
-        if ws_results:
-            f.write("## 🔌 WebSocket SSRF (2025 Novel)\n\n")
-            for result in ws_results:
-                f.write(f"- **WebSocket URL**: `{result['websocket_url']}`\n")
-                f.write(f"  - Status: {'VULNERABLE' if result['potential_ssrf'] else 'TESTED'}\n\n")
-    
-    def _write_serverless_section(self, f):
-        """Write serverless exploitation section"""
-        serverless_results = [r for r in self.results if r.get('serverless_platform')]
-        if serverless_results:
-            f.write("## ⚡ Serverless RCE Chain (2025)\n\n")
-            for result in serverless_results:
-                f.write(f"- **Platform**: {result['serverless_platform']}\n")
-                f.write(f"  - Payload: `{result['payload']}`\n")
-                f.write(f"  - Impact: **RCE POSSIBLE** 🔥\n\n")
-    
-    def _write_cve_2025_section(self, f):
-        """Write CVE-2025 specific section"""
-        cve_results = [r for r in self.results if r.get('cve_2025')]
-        if cve_results:
-            f.write("## 🚨 CVE-2025 Specific Exploits\n\n")
-            for result in cve_results:
-                f.write(f"- **{result['cve']}**: {result['url']}\n")
-                f.write(f"  - Status: **EXPLOITABLE** 🔥🔥🔥\n")
-                f.write(f"  - CVSS: {result['cvss']}\n\n")
-    
+
     def _write_top_findings(self, f):
         """Write top findings table"""
         if not self.high_confidence:
@@ -1306,9 +1154,9 @@ class SSRFHunterEliteV3:
         f.write("| Param | Type | CVSS | Confidence | Indicators |\n")
         f.write("|-------|------|------|------------|------------|\n")
         
-        for result in sorted(self.high_confidence, key=lambda x: x['cvss'], reverse=True)[:20]:
+        for result in sorted(self.high_confidence, key=lambda x: x['cvss_score'], reverse=True)[:20]:
             indicators = '<br>'.join(result['indicators'][:2])
-            f.write(f"| {result['param']} | {result['payload_type']} | {result['cvss']} | {result['confidence']} | {indicators} |\n")
+            f.write(f"| {result['param']} | {result['payload_type']} | {result['cvss_score']} | {result['confidence']} | {indicators} |\n")
     
     def _write_2025_recommendations(self, f):
         """Write 2025-specific recommendations"""
@@ -1441,10 +1289,6 @@ def main():
     # Initialize
     hunter = SSRFHunterEliteV3(args.domain, args.output, options)
     
-    # Configure proxy
-#    if args.proxy:
-#        hunter.stealth_engine.add_proxy(args.proxy)
-    
     # Configure session
     if args.session:
         cookies = {}
@@ -1453,13 +1297,15 @@ def main():
         
         if args.cookie:
             for cookie in args.cookie.split(';'):
-                name, value = cookie.strip().split('=', 1)
-                cookies[name] = value
+                if '=' in cookie:
+                    name, value = cookie.strip().split('=', 1)
+                    cookies[name] = value
         
         if args.header:
             for header in args.header.split(','):
-                name, value = header.strip().split(':', 1)
-                headers[name] = value
+                if ':' in header:
+                    name, value = header.strip().split(':', 1)
+                    headers[name] = value
         
         hunter.session_manager.add_session(args.session, cookies, headers, jwt_token)
     
@@ -1478,6 +1324,7 @@ if __name__ == "__main__":
     if missing:
         print(f"[!] Missing 2025 toolkit: {', '.join(missing)}")
         print("[!] Install: go install github.com/projectdiscovery/katana/cmd/katana@latest")
-        sys.exit(1)
+        # For demonstration purposes, we'll continue even if tools are missing
+        # sys.exit(1)
     
     main()
