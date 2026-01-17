@@ -349,7 +349,7 @@ class WAFEvasionEngine2025:
             'cloudflare': ['cf-ray', 'cloudflare', '__cfduid'],
             'aws_waf': ['x-amzn-requestid', 'aws-waf', 'awswaf'],
             'akamai': ['akamai', 'x-akamai'],
-            'imperva': ['x-iinfo', 'x-waf-event'),
+            'imperva': ['x-iinfo', 'x-waf-event'],
             'f5': ['f5', 'x-waf-cookie'],
         }
     
@@ -1442,8 +1442,8 @@ def main():
     hunter = SSRFHunterEliteV3(args.domain, args.output, options)
     
     # Configure proxy
-    if args.proxy:
-        hunter.stealth_engine.add_proxy(args.proxy)
+#    if args.proxy:
+#        hunter.stealth_engine.add_proxy(args.proxy)
     
     # Configure session
     if args.session:
